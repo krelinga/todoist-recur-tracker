@@ -3,7 +3,7 @@ import { deleteRowByTaskId, getTrackedRows, updateCount } from '../db';
 import { counterLabelName, counterLabelPattern, shortIdTag } from '../label-name';
 import type { Logger } from '../logger';
 import type { Metrics } from '../metrics';
-import type { TodoistClient } from '../todoist';
+import type { CompletionEvent, TodoistClient } from '../todoist';
 
 export type UpdateResult = {
     completionsRecorded: number;
@@ -22,11 +22,28 @@ function errMessage(err: unknown): string {
  * logged at WARN and skipped for this cycle rather than propagated - a bad
  * or failed lookup should only ever cost the one task it's checking
  * (section 6), never abort the whole cycle.
+ *
+ * Completion events are fetched ONCE for the whole cycle rather than
+ * per-task (see getCompletionEventsSince's doc comment in todoist.ts for
+ * why: the real API doesn't support filtering that call to one task). A
+ * failure fetching that shared list is logged once and treated as "no new
+ * completions this cycle" for every row, rather than aborting the cycle -
+ * tracking checks and pruning below are unaffected either way.
  */
 export async function runUpdatePhase(db: DatabaseSync, todoist: TodoistClient, logger: Logger, metrics: Metrics, now: Date): Promise<UpdateResult> {
     const rows = getTrackedRows(db);
     let completionsRecorded = 0;
     let pruned = 0;
+
+    let completionEvents: CompletionEvent[] = [];
+    if (rows.length > 0) {
+        const earliestCursor = rows.reduce((min, r) => (r.lastCompletionAt < min ? r.lastCompletionAt : min), rows[0].lastCompletionAt);
+        try {
+            completionEvents = await todoist.getCompletionEventsSince(earliestCursor);
+        } catch (err) {
+            logger.warn(`completion events fetch failed: ${errMessage(err)}, skipping completion counting this cycle`);
+        }
+    }
 
     for (const row of rows) {
         const labelId = row.labelId;
@@ -60,17 +77,12 @@ export async function runUpdatePhase(db: DatabaseSync, todoist: TodoistClient, l
             continue;
         }
 
-        let newCompletions: Date[];
-        try {
-            newCompletions = await todoist.getNewCompletions(actualLabelName, row.lastCompletionAt);
-        } catch (err) {
-            logger.warn(`completion check failed for ${shortIdTag(row.shortId)} (task ${row.taskId}): ${errMessage(err)}, skipping this cycle`);
-            continue;
-        }
+        const rowCursor = new Date(row.lastCompletionAt);
+        const newCompletions = completionEvents.filter((event) => event.taskId === row.taskId && event.completedAt > rowCursor);
 
         let newCount = row.recurrenceCount;
         if (newCompletions.length > 0) {
-            const maxCompletedAt = newCompletions.reduce((max, d) => (d > max ? d : max), newCompletions[0]);
+            const maxCompletedAt = newCompletions.reduce((max, e) => (e.completedAt > max ? e.completedAt : max), newCompletions[0].completedAt);
             newCount = row.recurrenceCount + newCompletions.length;
             // Commit to SQLite first (the durable source of truth), then
             // resync the label - never the reverse (section 6 idempotency).

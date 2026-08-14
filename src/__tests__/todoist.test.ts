@@ -73,26 +73,29 @@ describe('createTodoistClient', () => {
         await expect(client.getTask('task-1')).resolves.toBe(task);
     });
 
-    it('getNewCompletions filters by the counter label and paginates, collecting completedAt values', async () => {
+    it('getCompletionEventsSince fetches task:completed activity events from the date of sinceIso, paginating', async () => {
         const t1 = new Date('2026-08-14T01:00:00.000Z');
         const t2 = new Date('2026-08-14T02:00:00.000Z');
-        const getCompletedTasksByCompletionDate = vi
+        const getActivityLogs = vi
             .fn()
-            .mockResolvedValueOnce({ items: [fakeTask({ completedAt: t1 })], nextCursor: 'p2' })
-            .mockResolvedValueOnce({ items: [fakeTask({ completedAt: t2 })], nextCursor: null });
-        const api = { getCompletedTasksByCompletionDate } as unknown as TodoistApiLike;
+            .mockResolvedValueOnce({ results: [{ objectId: 'task-a', eventDate: t1 }], nextCursor: 'p2' })
+            .mockResolvedValueOnce({ results: [{ objectId: 'task-b', eventDate: t2 }], nextCursor: null });
+        const api = { getActivityLogs } as unknown as TodoistApiLike;
         const client = createTodoistClient(api, createMetrics());
 
-        const completions = await client.getNewCompletions('🔁 x2 #1', '2026-08-14T00:00:00.000Z');
+        const events = await client.getCompletionEventsSince('2026-08-14T00:30:00.000Z');
 
-        expect(completions).toEqual([t1, t2]);
-        const firstCallArgs = getCompletedTasksByCompletionDate.mock.calls[0][0];
+        expect(events).toEqual([
+            { taskId: 'task-a', completedAt: t1 },
+            { taskId: 'task-b', completedAt: t2 },
+        ]);
+        const firstCallArgs = getActivityLogs.mock.calls[0][0];
         expect(firstCallArgs).toMatchObject({
-            since: '2026-08-14T00:00:00.000Z',
-            filterQuery: '@🔁 x2 #1',
+            objectEventTypes: 'task:completed',
+            dateFrom: '2026-08-14',
             cursor: undefined,
         });
-        expect(getCompletedTasksByCompletionDate.mock.calls[1][0].cursor).toBe('p2');
+        expect(getActivityLogs.mock.calls[1][0].cursor).toBe('p2');
     });
 
     it('renameLabel updates the label name in place', async () => {

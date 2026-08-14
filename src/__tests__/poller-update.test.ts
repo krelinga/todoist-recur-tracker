@@ -11,7 +11,7 @@ function fakeTodoist(overrides: Partial<TodoistClient> = {}): TodoistClient {
         createLabel: vi.fn(),
         replaceTaskLabels: vi.fn(),
         getTask: vi.fn(),
-        getNewCompletions: vi.fn().mockResolvedValue([]),
+        getCompletionEventsSince: vi.fn().mockResolvedValue([]),
         renameLabel: vi.fn().mockResolvedValue(undefined),
         deleteLabel: vi.fn().mockResolvedValue(undefined),
         ...overrides,
@@ -46,7 +46,7 @@ describe('runUpdatePhase', () => {
     it('still tracked, no new completions: renames unconditionally (self-heal) and logs nothing at INFO', async () => {
         const todoist = fakeTodoist({
             getTask: vi.fn().mockResolvedValue(fakeTask(['🔁 x3 #1'])),
-            getNewCompletions: vi.fn().mockResolvedValue([]),
+            getCompletionEventsSince: vi.fn().mockResolvedValue([]),
         });
         const metrics = createMetrics();
         const logger = fakeLogger();
@@ -64,7 +64,11 @@ describe('runUpdatePhase', () => {
         const c2 = new Date('2026-08-14T02:00:00.000Z');
         const todoist = fakeTodoist({
             getTask: vi.fn().mockResolvedValue(fakeTask(['🔁 x3 #1'])),
-            getNewCompletions: vi.fn().mockResolvedValue([c1, c2]),
+            getCompletionEventsSince: vi.fn().mockResolvedValue([
+                { taskId: 'task-1', completedAt: c1 },
+                { taskId: 'task-1', completedAt: c2 },
+                { taskId: 'some-other-task', completedAt: c2 }, // must be filtered out by taskId
+            ]),
             renameLabel: vi.fn(async () => {
                 // By the time rename is called, the SQLite commit must already be visible.
                 expect(getRowByTaskId(db, 'task-1')?.recurrenceCount).toBe(5);
@@ -127,7 +131,7 @@ describe('runUpdatePhase', () => {
         // pre-crash count 2 - matching must be by shortId pattern, not exact name.
         const todoist = fakeTodoist({
             getTask: vi.fn().mockResolvedValue(fakeTask(['🔁 x2 #1'])),
-            getNewCompletions: vi.fn().mockResolvedValue([]),
+            getCompletionEventsSince: vi.fn().mockResolvedValue([]),
         });
         const metrics = createMetrics();
         const logger = fakeLogger();
@@ -138,7 +142,6 @@ describe('runUpdatePhase', () => {
         expect(getRowByTaskId(db, 'task-1')).toBeDefined();
         // Self-heals: resyncs the label to the current (correct) count.
         expect(todoist.renameLabel).toHaveBeenCalledWith('lbl-1', '🔁 x3 #1');
-        expect(todoist.getNewCompletions).toHaveBeenCalledWith('🔁 x2 #1', expect.any(String));
     });
 
     it('treats a failed tracking-check lookup as retry-next-cycle, not evidence the task is gone', async () => {
@@ -171,10 +174,10 @@ describe('runUpdatePhase', () => {
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('prune failed'));
     });
 
-    it('logs a warning and moves on when the completion fetch fails', async () => {
+    it('logs a warning once and treats it as no-new-completions when the shared events fetch fails (other rows unaffected)', async () => {
         const todoist = fakeTodoist({
             getTask: vi.fn().mockResolvedValue(fakeTask(['🔁 x3 #1'])),
-            getNewCompletions: vi.fn().mockRejectedValue(new Error('network error')),
+            getCompletionEventsSince: vi.fn().mockRejectedValue(new Error('network error')),
         });
         const metrics = createMetrics();
         const logger = fakeLogger();
@@ -182,15 +185,16 @@ describe('runUpdatePhase', () => {
         const result = await runUpdatePhase(db, todoist, logger, metrics, NOW);
 
         expect(result).toEqual({ completionsRecorded: 0, pruned: 0 });
-        expect(todoist.renameLabel).not.toHaveBeenCalled();
-        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('completion check failed'));
+        // Self-heal rename still runs - the fetch failure isn't a per-row skip.
+        expect(todoist.renameLabel).toHaveBeenCalledWith('lbl-1', '🔁 x3 #1');
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('completion events fetch failed'));
         expect(getRowByTaskId(db, 'task-1')?.recurrenceCount).toBe(3);
     });
 
     it('logs a warning when the rename fails, but the count commit already happened', async () => {
         const todoist = fakeTodoist({
             getTask: vi.fn().mockResolvedValue(fakeTask(['🔁 x3 #1'])),
-            getNewCompletions: vi.fn().mockResolvedValue([new Date('2026-08-14T01:00:00.000Z')]),
+            getCompletionEventsSince: vi.fn().mockResolvedValue([{ taskId: 'task-1', completedAt: new Date('2026-08-14T01:00:00.000Z') }]),
             renameLabel: vi.fn().mockRejectedValue(new Error('network error')),
         });
         const metrics = createMetrics();
@@ -201,5 +205,25 @@ describe('runUpdatePhase', () => {
         expect(result.completionsRecorded).toBe(1);
         expect(getRowByTaskId(db, 'task-1')?.recurrenceCount).toBe(4);
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('label rename failed'));
+    });
+
+    it('fetches completion events once using the earliest cursor across all rows, and attributes them by taskId', async () => {
+        insertTrackedTask(db, 'task-2', new Date('2026-07-01T00:00:00.000Z'));
+        setLabelId(db, 'task-2', 'lbl-2', new Date('2026-07-01T00:00:00.000Z'));
+        // task-1's cursor (set in beforeEach) is 2026-08-01; task-2's is 2026-07-01, earlier.
+        const getCompletionEventsSince = vi.fn().mockResolvedValue([]);
+        const todoist = fakeTodoist({
+            getTask: vi.fn((taskId: string) =>
+                Promise.resolve(taskId === 'task-1' ? fakeTask(['🔁 x3 #1']) : { ...fakeTask(['🔁 x0 #2']), id: 'task-2' }),
+            ),
+            getCompletionEventsSince,
+        });
+        const metrics = createMetrics();
+        const logger = fakeLogger();
+
+        await runUpdatePhase(db, todoist, logger, metrics, NOW);
+
+        expect(getCompletionEventsSince).toHaveBeenCalledTimes(1);
+        expect(getCompletionEventsSince).toHaveBeenCalledWith('2026-07-01T00:00:00.000Z');
     });
 });

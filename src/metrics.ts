@@ -9,7 +9,7 @@ export type TodoistEndpoint =
     | 'tasks_get'
     | 'tasks_filter'
     | 'tasks_update'
-    | 'tasks_completed_by_completion_date'
+    | 'activity_logs'
     | 'labels_create'
     | 'labels_update'
     | 'labels_delete';

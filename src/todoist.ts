@@ -5,10 +5,12 @@ import { instrumentTodoistCall, type Metrics } from './metrics';
  * Structural subset of TodoistApi this module actually calls - lets tests
  * pass a fake object instead of a real SDK client.
  */
-export type TodoistApiLike = Pick<
-    TodoistApi,
-    'getTasksByFilter' | 'addLabel' | 'updateTask' | 'getTask' | 'getCompletedTasksByCompletionDate' | 'updateLabel' | 'deleteLabel'
->;
+export type TodoistApiLike = Pick<TodoistApi, 'getTasksByFilter' | 'addLabel' | 'updateTask' | 'getTask' | 'getActivityLogs' | 'updateLabel' | 'deleteLabel'>;
+
+export type CompletionEvent = {
+    taskId: string;
+    completedAt: Date;
+};
 
 export type TodoistClient = {
     /** GET /tasks?filter=@<label>, per design doc section 5. Paginates to completion. */
@@ -20,12 +22,23 @@ export type TodoistClient = {
     /** GET /tasks/{id}; resolves to null on 404 rather than throwing. */
     getTask(taskId: string): Promise<Task | null>;
     /**
-     * Completions of the task carrying `counterLabelName` since `sinceIso`.
-     * Filters GET /tasks/completed/by_completion_date by that label - since
-     * counter labels are unique per task (design doc section 2), this scopes
-     * the query to exactly one task's completions.
+     * Every task-completed event across the whole account since `sinceIso`
+     * (date-granularity server-side; callers must re-filter to exact
+     * timestamps per task).
+     *
+     * This deliberately does NOT use GET /tasks/completed/by_completion_date
+     * as design doc section 5 originally specified. Live testing against a
+     * real Todoist instance found that endpoint (and by_due_date) never
+     * returns completions of *recurring* tasks at all - only genuine
+     * one-time completions - which is exactly the case this tool exists to
+     * track. The activity log's `completed` events do capture recurring
+     * completions, but its documented `objectId` filter is silently ignored
+     * server-side (confirmed with a raw request bypassing the SDK), so
+     * filtering to one task has to happen client-side instead. Because of
+     * that, this fetches once per poll cycle for every tracked row rather
+     * than per-task - see runUpdatePhase in poller/update.ts.
      */
-    getNewCompletions(counterLabelName: string, sinceIso: string): Promise<Date[]>;
+    getCompletionEventsSince(sinceIso: string): Promise<CompletionEvent[]>;
     /** POST /labels/{id} to rename in place. */
     renameLabel(labelId: string, newName: string): Promise<void>;
     /** DELETE /labels/{id}; a 404 is treated as success (already gone). */
@@ -69,25 +82,20 @@ export function createTodoistClient(api: TodoistApiLike, metrics: Metrics): Todo
         });
     }
 
-    async function getNewCompletions(counterLabelName: string, sinceIso: string): Promise<Date[]> {
-        const untilIso = new Date().toISOString();
-        const completedAts: Date[] = [];
+    async function getCompletionEventsSince(sinceIso: string): Promise<CompletionEvent[]> {
+        const dateFrom = sinceIso.slice(0, 10); // activity log date filters are date-granularity only
+        const events: CompletionEvent[] = [];
         let cursor: string | null | undefined;
         do {
-            const page = await instrumentTodoistCall(metrics, 'tasks_completed_by_completion_date', () =>
-                api.getCompletedTasksByCompletionDate({
-                    since: sinceIso,
-                    until: untilIso,
-                    filterQuery: `@${counterLabelName}`,
-                    cursor,
-                }),
+            const page = await instrumentTodoistCall(metrics, 'activity_logs', () =>
+                api.getActivityLogs({ objectEventTypes: 'task:completed', dateFrom, cursor }),
             );
-            for (const item of page.items) {
-                if (item.completedAt) completedAts.push(item.completedAt);
+            for (const event of page.results) {
+                events.push({ taskId: event.objectId, completedAt: event.eventDate });
             }
             cursor = page.nextCursor;
         } while (cursor);
-        return completedAts;
+        return events;
     }
 
     async function renameLabel(labelId: string, newName: string): Promise<void> {
@@ -105,5 +113,5 @@ export function createTodoistClient(api: TodoistApiLike, metrics: Metrics): Todo
         });
     }
 
-    return { findTasksByLabel, createLabel, replaceTaskLabels, getTask, getNewCompletions, renameLabel, deleteLabel };
+    return { findTasksByLabel, createLabel, replaceTaskLabels, getTask, getCompletionEventsSince, renameLabel, deleteLabel };
 }
