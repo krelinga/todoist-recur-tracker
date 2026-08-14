@@ -3,6 +3,7 @@ import { loadConfig } from './config';
 import { openDb } from './db';
 import { createLogger } from './logger';
 import { createMetrics } from './metrics';
+import { createCompletionScanCursor } from './poller/completion-scan-cursor';
 import { runPollCycle } from './poller/cycle';
 import { createMetricsServer } from './server';
 import { createTodoistClient } from './todoist';
@@ -30,6 +31,7 @@ function main(): void {
     const metrics = createMetrics();
     const api = new TodoistApi(config.todoistApiToken);
     const todoist = createTodoistClient(api, metrics);
+    const scanCursor = createCompletionScanCursor();
 
     const metricsServer = createMetricsServer(metrics);
     metricsServer.listen(config.metricsPort, () => {
@@ -42,7 +44,7 @@ function main(): void {
             logger.warn('previous poll cycle still running, skipping this tick');
             return;
         }
-        cycleInFlight = runPollCycle(db, todoist, logger, metrics, config.starterLabel, config.dbPath).finally(() => {
+        cycleInFlight = runPollCycle(db, todoist, logger, metrics, config.starterLabel, config.dbPath, scanCursor).finally(() => {
             cycleInFlight = null;
         });
     };

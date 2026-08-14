@@ -3,6 +3,7 @@ import { countTrackedRows, dbFileSizeBytes } from '../db';
 import type { Logger } from '../logger';
 import type { Metrics } from '../metrics';
 import type { TodoistClient } from '../todoist';
+import type { CompletionScanCursor } from './completion-scan-cursor';
 import { runOnboardPhase } from './onboard';
 import { runUpdatePhase } from './update';
 
@@ -21,13 +22,14 @@ export async function runPollCycle(
     metrics: Metrics,
     starterLabel: string,
     dbPath: string,
+    scanCursor: CompletionScanCursor,
 ): Promise<void> {
     const stopTimer = metrics.pollDurationSeconds.startTimer();
     const start = Date.now();
     try {
         const now = new Date();
         const { onboarded } = await runOnboardPhase(db, todoist, logger, metrics, starterLabel, now);
-        const { completionsRecorded, pruned } = await runUpdatePhase(db, todoist, logger, metrics, now);
+        const { completionsRecorded, pruned } = await runUpdatePhase(db, todoist, logger, metrics, now, scanCursor);
 
         const tracked = countTrackedRows(db);
         metrics.trackedTasks.set(tracked);

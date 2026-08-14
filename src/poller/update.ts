@@ -4,6 +4,7 @@ import { counterLabelName, counterLabelPattern, shortIdTag } from '../label-name
 import type { Logger } from '../logger';
 import type { Metrics } from '../metrics';
 import type { CompletionEvent, TodoistClient } from '../todoist';
+import type { CompletionScanCursor } from './completion-scan-cursor';
 
 export type UpdateResult = {
     completionsRecorded: number;
@@ -13,6 +14,14 @@ export type UpdateResult = {
 function errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
+
+// Generous margin subtracted from the last successful scan time to bound the
+// completion-events fetch window (see scanCursor below). Covers any
+// transient per-row failure (a task's tracking check erroring for a while)
+// without needing the fetch to reach back to that row's own stale cursor -
+// see the design doc's discussion of why a naive global cursor without this
+// margin would risk silently missing a completion.
+const COMPLETION_SCAN_FUDGE_MS = 2 * 24 * 60 * 60 * 1000; // 2 days
 
 /**
  * Phase B (design doc section 3): for every tracked row, check whether the
@@ -29,17 +38,40 @@ function errMessage(err: unknown): string {
  * failure fetching that shared list is logged once and treated as "no new
  * completions this cycle" for every row, rather than aborting the cycle -
  * tracking checks and pruning below are unaffected either way.
+ *
+ * The fetch window is bounded by `scanCursor` (the last successful fetch
+ * time, minus COMPLETION_SCAN_FUDGE_MS) rather than by the oldest tracked
+ * row's `last_completion_at`. That's safe even for a task that only
+ * recurs yearly: the fetch only needs to include events since we last
+ * looked, not since that row's own history, because per-row matching
+ * (`event.completedAt > row.lastCompletionAt` below) independently decides
+ * whether an event is new to that row regardless of how wide the fetch
+ * was. Before the first successful fetch (cursor is null - always true
+ * right after a restart, since the cursor is deliberately in-memory only),
+ * fall back to today's min-per-row-cursor bootstrap so a restart can never
+ * cause a gap.
  */
-export async function runUpdatePhase(db: DatabaseSync, todoist: TodoistClient, logger: Logger, metrics: Metrics, now: Date): Promise<UpdateResult> {
+export async function runUpdatePhase(
+    db: DatabaseSync,
+    todoist: TodoistClient,
+    logger: Logger,
+    metrics: Metrics,
+    now: Date,
+    scanCursor: CompletionScanCursor,
+): Promise<UpdateResult> {
     const rows = getTrackedRows(db);
     let completionsRecorded = 0;
     let pruned = 0;
 
     let completionEvents: CompletionEvent[] = [];
     if (rows.length > 0) {
-        const earliestCursor = rows.reduce((min, r) => (r.lastCompletionAt < min ? r.lastCompletionAt : min), rows[0].lastCompletionAt);
+        const lastScan = scanCursor.get();
+        const sinceIso = lastScan
+            ? new Date(lastScan.getTime() - COMPLETION_SCAN_FUDGE_MS).toISOString()
+            : rows.reduce((min, r) => (r.lastCompletionAt < min ? r.lastCompletionAt : min), rows[0].lastCompletionAt);
         try {
-            completionEvents = await todoist.getCompletionEventsSince(earliestCursor);
+            completionEvents = await todoist.getCompletionEventsSince(sinceIso);
+            scanCursor.recordSuccess(now);
         } catch (err) {
             logger.warn(`completion events fetch failed: ${errMessage(err)}, skipping completion counting this cycle`);
         }
