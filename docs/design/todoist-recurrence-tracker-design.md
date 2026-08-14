@@ -35,7 +35,7 @@
   - Alongside the poll loop, the container runs a small always-on HTTP server exposing `/metrics` on `METRICS_PORT` (default `9090`) for Prometheus to scrape between poll cycles — publish that port (`-p 9090:9090`) to reach it from outside the container.
   - The SQLite state file lives in a named Docker volume (e.g. `-v recurrence-tracker-data:/app/data`), not a bind mount — Docker owns and persists it independent of any particular host path. That pushes a small requirement onto the container's startup logic: on boot, before starting the poll loop, it needs to check whether `tracked_tasks.db` already exists at that path inside the volume and run schema init/migrations only if it doesn't, so a fresh named volume (first run, or a volume that was never populated) bootstraps cleanly while an existing one is left untouched.
   - Logs go to stdout/stderr so they show up in `docker logs` without extra plumbing.
-- Chosen counting strategy is incremental (store a cursor per task, only add newly-seen completions) rather than recomputing the full count from history every poll — this isn't just an efficiency choice: Todoist's completed-tasks endpoint only returns the last 3 months of history, so recomputing from scratch would silently undercount any task tracked longer than that. Keeping our own running tally is the only way to preserve completions that have aged out of Todoist's window.
+- Chosen counting strategy is incremental (store a cursor per task, only add newly-seen completions) rather than recomputing the full count from history every poll — this isn't just an efficiency choice: Todoist's completion-history sources are retention-limited (the old completed-tasks endpoint documents a 3-month window; the Activity Log actually used for detection, see section 3, has its own — unconfirmed — limit), so recomputing from scratch would silently undercount any task tracked longer than that. Keeping our own running tally is the only way to preserve completions that have aged out of Todoist's window.
 
 ## 2. The catch in the naive approach — and the fix
 
@@ -72,13 +72,15 @@ The leading `🔁` is a fixed, decorative tag, chosen so the count reads as the 
    4. Attach counter label,              no recurrence left, or label
       remove starter label               manually removed) → delete
                                          the label, delete the row
-                                      3. Otherwise: GET completions
-                                         for that task_id since
-                                         last_completion_at; if new
-                                         ones found, commit the
-                                         updated count + cursor to
-                                         the state store, then sync
-                                         the label name to match
+                                      3. Otherwise: look up this
+                                         task_id in the shared
+                                         completion-events feed
+                                         (fetched once per cycle,
+                                         not per task — see below);
+                                         if new ones found, commit
+                                         the updated count + cursor
+                                         to the state store, then
+                                         sync the label name to match
               │                                │
               └───────────────┬────────────────┘
                               ▼
@@ -93,6 +95,8 @@ Two phases, one process, one Todoist token. No queue, no external services neede
 
 Keying this check on `task_id` rather than on a label-name filter is deliberate. The label's name changes every time the count does, so a name-based filter would be matching on mutable data — and if a rename ever failed partway (see Idempotency in section 6), the next cycle's lookup would find nothing and wrongly conclude the task was gone, pruning a perfectly healthy task and discarding its count. `task_id` never changes, so the check can't be fooled that way, and inspecting the returned `labels` array locally still catches manual label removal. Checking per-task rather than batching also means one bad or failed lookup only ever affects the single task it's checking, not the whole tracked set. A task that goes quiet and later starts recurring again just gets re-onboarded from scratch (starter label re-added, counter restarts at 0) — acceptable in exchange for not needing a second detection path at all.
 
+**Completion detection is account-wide, not per-task — a departure from the rest of Phase B, forced by what the real API actually does.** The original plan was a per-task `GET /tasks/completed/by_completion_date` call, matching the per-task shape of everything else in this design. Live testing against a real Todoist instance found that this doesn't work: that endpoint (and its `/by_due_date` sibling) never returns a completed occurrence of a *recurring* task, only genuine one-time completions — confirmed by completing a real recurring test task and getting zero results back, while the same event showed up immediately in the Activity Log. The Activity Log's `completed` events do capture recurring completions, but its documented per-object filter is silently ignored server-side (confirmed with a raw request bypassing the SDK client), so there's no way to scope that call to one task at the API layer. Given that, Phase B fetches every `task:completed` activity event once per cycle — using the earliest `last_completion_at` across all tracked rows as the lower bound — and matches events to rows by `task_id` locally, rather than issuing one completions call per task. See the updated trade-off row in section 7.
+
 ## 4. Data model
 
 State store (SQLite is a good fit: durable, transactional, zero ops overhead for a single-writer personal script):
@@ -103,7 +107,7 @@ tracked_tasks
   task_id              text unique not null                -- Todoist task ID (stable across recurrences)
   label_id             text               -- Todoist label ID for this task's counter
   recurrence_count     integer default 0
-  last_completion_at   timestamp not null -- cursor: completed_at of the most recent completion counted so far;
+  last_completion_at   timestamp not null -- cursor: event timestamp of the most recent completion counted so far;
                                           -- initialized to onboarding time, never null
   created_at            timestamp
   updated_at            timestamp
@@ -111,11 +115,11 @@ tracked_tasks
 
 `short_id` is assigned once, at onboarding, and is what gets embedded in the label name (`🔁 x<count> #<short_id>`) — `task_id` remains the key every Todoist API call actually uses. `last_completion_at` is what makes incremental counting safe across restarts: each poll asks "anything newer than this?" instead of re-deriving state from scratch.
 
-**Counting starts at zero, not from history.** `last_completion_at` is seeded with the onboarding timestamp rather than left null, so the first poll only sees completions that happen *after* the task was opted in. That's a deliberate choice: Todoist only exposes 3 months of completion history, so backfilling would produce a count that's accurate for recently-created tasks and silently truncated for long-lived ones — worse than a count that's honestly "since tracking began." A null cursor would also make "everything since the beginning of time" the natural reading, which would contradict the counter starting at `x0`.
+**Counting starts at zero, not from history.** `last_completion_at` is seeded with the onboarding timestamp rather than left null, so the first poll only sees completions that happen *after* the task was opted in. That's a deliberate choice: Todoist's completion-history sources are retention-limited (see section 1), so backfilling would produce a count that's accurate for recently-created tasks and silently truncated for long-lived ones — worse than a count that's honestly "since tracking began." A null cursor would also make "everything since the beginning of time" the natural reading, which would contradict the counter starting at `x0`.
 
-**Always take the cursor value from Todoist's returned `completed_at`, never from the local clock.** Advancing it to `Date.now()` after a successful poll would introduce clock-skew risk in the one direction that loses data: if the local clock runs even slightly ahead of Todoist's, a completion timestamped in that gap would fall before the cursor on the next poll and never be counted.
+**Always take the cursor value from Todoist's returned event timestamp, never from the local clock.** Advancing it to `Date.now()` after a successful poll would introduce clock-skew risk in the one direction that loses data: if the local clock runs even slightly ahead of Todoist's, a completion timestamped in that gap would fall before the cursor on the next poll and never be counted.
 
-**Why a timestamp and not a completion-event ID.** Todoist's `by_completion_date` endpoint filters by date range in the first place, and the current API's item IDs are opaque alphanumeric strings with no documented ordering guarantee, so an ID-based cursor wouldn't be safe even if the endpoint accepted one. There's deliberately no separate table tracking individual completion-event IDs for dedup either — see the Idempotency note in section 6 for how double-counting is avoided without one. There's also no `status` column: a row's existence *is* the "still tracking" signal, and the per-task check in section 3 is what decides whether it should keep existing.
+**Why a timestamp and not a completion-event ID.** The Activity Log used for completion detection (section 3) filters by date range in the first place, and activity-event IDs are opaque numeric strings with no documented ordering guarantee, so an ID-based cursor wouldn't be safe even if the endpoint accepted one. There's deliberately no separate table tracking individual completion-event IDs for dedup either — see the Idempotency note in section 6 for how double-counting is avoided without one. There's also no `status` column: a row's existence *is* the "still tracking" signal, and the per-task check in section 3 is what decides whether it should keep existing.
 
 ## 5. API calls (Todoist REST API v1)
 
@@ -124,12 +128,12 @@ tracked_tasks
 | Find starter-labeled tasks | `GET /tasks?filter=@<STARTER_LABEL>` |
 | Create counter label | `POST /labels` `{name: "🔁 x0 #<short_id>"}` |
 | Attach + remove labels | `POST /tasks/{id}` with full replacement `labels` array |
-| Check for new completions | `GET /tasks/completed/by_completion_date` filtered to the task, `since=<last_completion_at>` |
+| Check for new completions | `GET /activities?objectEventTypes=task:completed&dateFrom=<date>` — account-wide (can't be filtered to one task; see section 3), fetched once per cycle and matched to tracked tasks by `task_id` locally |
 | Bump the counter | `POST /labels/{label_id}` `{name: "🔁 x<n> #<short_id>"}` |
 | Check if a tracked task is still tracked | `GET /tasks/{task_id}` — 404, or a 200 whose `labels` array no longer contains the counter label, both mean "stop tracking" |
 | Prune a task that's no longer tracked | `DELETE /labels/{label_id}` |
 
-Rename-in-place is cheap and is the whole trick: the label *is* the storage for the human-visible count, while the local state store is the storage for the operational cursor that makes incrementing safe. Note that only the starter-label lookup uses Todoist's `@label` filter syntax — the per-task tracking check deliberately goes through `GET /tasks/{task_id}` instead, since a filter on the counter label would be matching a name that changes with every count bump (see the cleanup policy in section 3 for why that's unsafe).
+Rename-in-place is cheap and is the whole trick: the label *is* the storage for the human-visible count, while the local state store is the storage for the operational cursor that makes incrementing safe. Note that only the starter-label lookup uses Todoist's `@label` filter syntax — the per-task tracking check deliberately goes through `GET /tasks/{task_id}` instead, since a filter on the counter label would be matching a name that changes with every count bump (see the cleanup policy in section 3 for why that's unsafe). The completions call uses neither mechanism: it isn't filterable to one task at all (Todoist ignores the Activity Log's documented per-object filter server-side), which is why it's fetched once per cycle and matched locally instead — see section 3.
 
 ## 6. Reliability
 
@@ -145,10 +149,11 @@ Rename-in-place is cheap and is the whole trick: the label *is* the storage for 
 | Decision | Upside | Cost |
 |---|---|---|
 | Self-hosted Docker container vs. a managed/hosted automation platform | Full control, no third-party service in the loop, deployable on any existing Docker host | Hosting, secrets, monitoring, and restart logic all become the operator's responsibility |
-| Incremental counting vs. recompute-from-history each poll | Correctness beyond 3 months, not just efficiency — Todoist's completed-tasks endpoint only returns a 3-month window, so recompute-from-history would silently undercount any long-lived tracked task | Needs durable state; a corrupted or lost state file makes the running count permanently wrong, with no way to recompute it from Todoist for anything older than 3 months — an accepted risk here in exchange for a simpler system |
+| Incremental counting vs. recompute-from-history each poll | Correctness beyond whatever window Todoist happens to retain, not just efficiency — none of the completion-history sources this design has tried (the completed-tasks endpoints, the Activity Log actually used per section 3) claim to retain history indefinitely, so recompute-from-history would silently undercount any long-lived tracked task once that window is exceeded | Needs durable state; a corrupted or lost state file makes the running count permanently wrong, with no way to recompute it from Todoist beyond whatever retention window applies — an accepted risk here in exchange for a simpler system. (Todoist documents 3 months for the old completed-tasks endpoint; the Activity Log's actual retention window — now the thing that matters, per section 3 — hasn't been separately confirmed, and may be shorter, especially on non-paid plans. Worth checking directly if this ever becomes load-bearing.) |
 | Count stored in the label text itself | Zero-dashboard visibility, count is right there on the task | Fragile to manual edits — a hand-edited counter label gets overwritten on the next cycle from local state, not read back from Todoist |
 | Locally-assigned short-ID label names (vs. embedding the raw Todoist task ID) | Guaranteed uniqueness, survives task renames, and stays compact (`#42` vs `#6839201422`) | One more thing living in the state store — the short_id ↔ task_id mapping is now load-bearing, so losing it means the label can no longer be traced back to its task automatically |
-| Per-task tracking and completion queries (vs. batching across all tracked labels) | Small blast radius — a bad or failed response only ever affects the one task it's checking, not the whole tracked set; and keying on immutable `task_id` avoids the false-prune risk a mutable-label-name filter would carry | More API calls per cycle (two per tracked task). Not a real concern at the personal scale this is built for, and not the fix if it ever did become one — spacing the per-task queries out over the poll interval rather than batching them would be the preferred way to handle a much larger tracked-task count |
+| Per-task tracking checks (vs. batching across all tracked labels) | Small blast radius — a bad or failed response only ever affects the one task it's checking, not the whole tracked set; and keying on immutable `task_id` avoids the false-prune risk a mutable-label-name filter would carry | One API call per tracked task per cycle. Not a real concern at the personal scale this is built for, and not the fix if it ever did become one — spacing the per-task queries out over the poll interval rather than batching them would be the preferred way to handle a much larger tracked-task count |
+| Completion detection batched account-wide (one Activity Log call per cycle) instead of per-task | Cheaper than a per-task call would be — one request regardless of how many tasks are tracked | Not actually a choice: Todoist's completed-tasks endpoints don't return recurring completions at all, and the Activity Log's per-object filter isn't honored server-side (both discovered via live testing against a real instance, not anticipated in the original design). Client-side matching means a cycle that follows a long outage re-fetches a wider account-wide event window rather than a narrow per-task one, and — unlike the per-task tracking check — a single failed fetch costs the whole tracked set its completion count for that cycle, not just one task (see section 3) |
 | Timestamp cursor (vs. a completion-event-ID ledger table) | One column instead of a second table; no join or cleanup logic for a growing event log | Relies on commit-then-sync ordering (see Idempotency in section 6) rather than a durable per-event dedup record — an accepted trade given how unlikely same-instant duplicate completions are for a single task |
 | `node:sqlite` (vs. `better-sqlite3`) for the state store (see section 10) | No native-module dependency, no compiler toolchain in the Docker build, one less thing in `package.json` | Newer and less battle-tested than `better-sqlite3`; ties the image to a Node version where it's stable (24+) rather than working unchanged all the way back to Node 20 |
 | Hand-rolled logger (vs. `pino`/`winston`) for the leveled stdout logging in section 9 | No dependency for something this small — four levels, a handful of call sites, no structured-log shipping target to satisfy | Loses what a real logging library provides for free (JSON output mode, child loggers, transport plugins) if requirements ever grow past what this design calls for |
@@ -178,7 +183,7 @@ An always-on `/metrics` HTTP endpoint (see the Docker bullet in section 1) expos
 
 | Metric | Type | Purpose |
 |---|---|---|
-| `recurrence_tracker_todoist_requests_total{endpoint, outcome="success\|error"}` | Counter | Request volume and error rate, broken down by endpoint (labels, tasks, completed-tasks) — labels here are a small fixed set of endpoint names, not per-task values, so cardinality stays bounded. |
+| `recurrence_tracker_todoist_requests_total{endpoint, outcome="success\|error"}` | Counter | Request volume and error rate, broken down by endpoint (tasks, labels, activity log) — labels here are a small fixed set of endpoint names, not per-task values, so cardinality stays bounded. |
 | `recurrence_tracker_todoist_request_duration_seconds{endpoint}` | Histogram | Latency per endpoint — useful for spotting Todoist-side slowness vs. a problem in the container itself. |
 
 **State store:**
