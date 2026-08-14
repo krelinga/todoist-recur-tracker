@@ -73,3 +73,5 @@ npm test            # vitest run
 npm run build       # compiles src/ (excluding tests) to dist/
 npm start           # runs the compiled dist/index.js
 ```
+
+`npm install` also points git at the repo's `.githooks/` directory (via the `prepare` script), which installs a pre-commit check that blocks a commit if `package.json`'s version doesn't match `package-lock.json`'s — run `npm install` again to resync after bumping the version.

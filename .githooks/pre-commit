@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Blocks a commit if package.json's version doesn't match package-lock.json's.
+# Fix: run `npm install` (no dependency changes needed to trigger the sync),
+# then re-stage both files.
+set -euo pipefail
+
+# Only relevant if one of these two files is actually part of this commit.
+if ! git diff --cached --name-only | grep -qE '^(package\.json|package-lock\.json)$'; then
+    exit 0
+fi
+
+pkg_version=$(git show :package.json | node -e "console.log(JSON.parse(require('fs').readFileSync(0,'utf8')).version)")
+lock_version=$(git show :package-lock.json | node -e "console.log(JSON.parse(require('fs').readFileSync(0,'utf8')).version)")
+
+if [ "$pkg_version" != "$lock_version" ]; then
+    echo "pre-commit: package.json version ($pkg_version) does not match package-lock.json version ($lock_version)." >&2
+    echo "Run 'npm install' to sync package-lock.json, then re-stage both files." >&2
+    exit 1
+fi
