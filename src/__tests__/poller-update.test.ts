@@ -2,6 +2,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getRowByTaskId, insertTrackedTask, openDb, setLabelId, updateCount } from '../db';
 import { createMetrics } from '../metrics';
+import { createCompletionScanCursor } from '../poller/completion-scan-cursor';
 import { runUpdatePhase } from '../poller/update';
 import type { TodoistClient } from '../todoist';
 
@@ -51,7 +52,7 @@ describe('runUpdatePhase', () => {
         const metrics = createMetrics();
         const logger = fakeLogger();
 
-        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW);
+        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW, createCompletionScanCursor());
 
         expect(result).toEqual({ completionsRecorded: 0, pruned: 0 });
         expect(todoist.renameLabel).toHaveBeenCalledWith('lbl-1', '🔁 x3 #1');
@@ -77,7 +78,7 @@ describe('runUpdatePhase', () => {
         const metrics = createMetrics();
         const logger = fakeLogger();
 
-        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW);
+        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW, createCompletionScanCursor());
 
         expect(result).toEqual({ completionsRecorded: 2, pruned: 0 });
         expect(todoist.renameLabel).toHaveBeenCalledWith('lbl-1', '🔁 x5 #1');
@@ -101,7 +102,7 @@ describe('runUpdatePhase', () => {
         const metrics = createMetrics();
         const logger = fakeLogger();
 
-        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW);
+        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW, createCompletionScanCursor());
 
         expect(result).toEqual({ completionsRecorded: 0, pruned: 1 });
         expect(todoist.deleteLabel).toHaveBeenCalledWith('lbl-1');
@@ -119,7 +120,7 @@ describe('runUpdatePhase', () => {
         const metrics = createMetrics();
         const logger = fakeLogger();
 
-        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW);
+        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW, createCompletionScanCursor());
 
         expect(result.pruned).toBe(1);
         expect(todoist.deleteLabel).toHaveBeenCalledWith('lbl-1');
@@ -136,7 +137,7 @@ describe('runUpdatePhase', () => {
         const metrics = createMetrics();
         const logger = fakeLogger();
 
-        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW);
+        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW, createCompletionScanCursor());
 
         expect(result.pruned).toBe(0);
         expect(getRowByTaskId(db, 'task-1')).toBeDefined();
@@ -151,7 +152,7 @@ describe('runUpdatePhase', () => {
         const metrics = createMetrics();
         const logger = fakeLogger();
 
-        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW);
+        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW, createCompletionScanCursor());
 
         expect(result).toEqual({ completionsRecorded: 0, pruned: 0 });
         expect(todoist.deleteLabel).not.toHaveBeenCalled();
@@ -167,7 +168,7 @@ describe('runUpdatePhase', () => {
         const metrics = createMetrics();
         const logger = fakeLogger();
 
-        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW);
+        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW, createCompletionScanCursor());
 
         expect(result.pruned).toBe(0);
         expect(getRowByTaskId(db, 'task-1')).toBeDefined();
@@ -181,14 +182,18 @@ describe('runUpdatePhase', () => {
         });
         const metrics = createMetrics();
         const logger = fakeLogger();
+        const scanCursor = createCompletionScanCursor();
 
-        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW);
+        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW, scanCursor);
 
         expect(result).toEqual({ completionsRecorded: 0, pruned: 0 });
         // Self-heal rename still runs - the fetch failure isn't a per-row skip.
         expect(todoist.renameLabel).toHaveBeenCalledWith('lbl-1', '🔁 x3 #1');
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('completion events fetch failed'));
         expect(getRowByTaskId(db, 'task-1')?.recurrenceCount).toBe(3);
+        // A failed fetch must not advance the cursor - that's what makes a run
+        // of failures self-widen the window on the next attempt.
+        expect(scanCursor.get()).toBeNull();
     });
 
     it('logs a warning when the rename fails, but the count commit already happened', async () => {
@@ -200,14 +205,14 @@ describe('runUpdatePhase', () => {
         const metrics = createMetrics();
         const logger = fakeLogger();
 
-        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW);
+        const result = await runUpdatePhase(db, todoist, logger, metrics, NOW, createCompletionScanCursor());
 
         expect(result.completionsRecorded).toBe(1);
         expect(getRowByTaskId(db, 'task-1')?.recurrenceCount).toBe(4);
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('label rename failed'));
     });
 
-    it('fetches completion events once using the earliest cursor across all rows, and attributes them by taskId', async () => {
+    it('bootstraps from the earliest per-row cursor when the scan cursor has never succeeded (e.g. right after a restart)', async () => {
         insertTrackedTask(db, 'task-2', new Date('2026-07-01T00:00:00.000Z'));
         setLabelId(db, 'task-2', 'lbl-2', new Date('2026-07-01T00:00:00.000Z'));
         // task-1's cursor (set in beforeEach) is 2026-08-01; task-2's is 2026-07-01, earlier.
@@ -220,10 +225,67 @@ describe('runUpdatePhase', () => {
         });
         const metrics = createMetrics();
         const logger = fakeLogger();
+        const scanCursor = createCompletionScanCursor();
+        expect(scanCursor.get()).toBeNull();
 
-        await runUpdatePhase(db, todoist, logger, metrics, NOW);
+        await runUpdatePhase(db, todoist, logger, metrics, NOW, scanCursor);
 
         expect(getCompletionEventsSince).toHaveBeenCalledTimes(1);
         expect(getCompletionEventsSince).toHaveBeenCalledWith('2026-07-01T00:00:00.000Z');
+        // A successful fetch advances the cursor, so future cycles stop bootstrapping.
+        expect(scanCursor.get()).toEqual(NOW);
+    });
+
+    it('once the scan cursor has a value, uses (lastScan - 2 days) as dateFrom regardless of any row\'s own cursor', async () => {
+        // task-2's own cursor is far older than the 2-day fudge window - if the
+        // fetch window were still driven by per-row cursors, dateFrom would be
+        // 2026-01-01, not (lastScan - 2 days). It must not be, or a single
+        // rarely-recurring task would force an ever-widening account-wide scan.
+        insertTrackedTask(db, 'task-2', new Date('2026-01-01T00:00:00.000Z'));
+        setLabelId(db, 'task-2', 'lbl-2', new Date('2026-01-01T00:00:00.000Z'));
+        const getCompletionEventsSince = vi.fn().mockResolvedValue([]);
+        const todoist = fakeTodoist({
+            getTask: vi.fn((taskId: string) =>
+                Promise.resolve(taskId === 'task-1' ? fakeTask(['🔁 x3 #1']) : { ...fakeTask(['🔁 x0 #2']), id: 'task-2' }),
+            ),
+            getCompletionEventsSince,
+        });
+        const metrics = createMetrics();
+        const logger = fakeLogger();
+        const scanCursor = createCompletionScanCursor();
+        scanCursor.recordSuccess(new Date('2026-08-14T00:00:00.000Z'));
+
+        await runUpdatePhase(db, todoist, logger, metrics, NOW, scanCursor);
+
+        expect(getCompletionEventsSince).toHaveBeenCalledWith('2026-08-12T00:00:00.000Z'); // 2026-08-14 minus 2 days
+    });
+
+    it('advances the scan cursor to `now` on a successful fetch', async () => {
+        const todoist = fakeTodoist({
+            getTask: vi.fn().mockResolvedValue(fakeTask(['🔁 x3 #1'])),
+            getCompletionEventsSince: vi.fn().mockResolvedValue([]),
+        });
+        const metrics = createMetrics();
+        const logger = fakeLogger();
+        const scanCursor = createCompletionScanCursor();
+
+        await runUpdatePhase(db, todoist, logger, metrics, NOW, scanCursor);
+
+        expect(scanCursor.get()).toEqual(NOW);
+    });
+
+    it('does not fetch completion events at all when there are no tracked rows', async () => {
+        const dbEmpty = openDb(':memory:');
+        const getCompletionEventsSince = vi.fn().mockResolvedValue([]);
+        const todoist = fakeTodoist({ getCompletionEventsSince });
+        const metrics = createMetrics();
+        const logger = fakeLogger();
+        const scanCursor = createCompletionScanCursor();
+
+        await runUpdatePhase(dbEmpty, todoist, logger, metrics, NOW, scanCursor);
+
+        expect(getCompletionEventsSince).not.toHaveBeenCalled();
+        expect(scanCursor.get()).toBeNull();
+        dbEmpty.close();
     });
 });

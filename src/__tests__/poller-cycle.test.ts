@@ -2,6 +2,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { insertTrackedTask, openDb, setLabelId } from '../db';
 import { createMetrics } from '../metrics';
+import { createCompletionScanCursor } from '../poller/completion-scan-cursor';
 import { runPollCycle } from '../poller/cycle';
 import type { TodoistClient } from '../todoist';
 
@@ -11,7 +12,7 @@ function fakeTodoist(overrides: Partial<TodoistClient> = {}): TodoistClient {
         createLabel: vi.fn(),
         replaceTaskLabels: vi.fn(),
         getTask: vi.fn(),
-        getNewCompletions: vi.fn().mockResolvedValue([]),
+        getCompletionEventsSince: vi.fn().mockResolvedValue([]),
         renameLabel: vi.fn().mockResolvedValue(undefined),
         deleteLabel: vi.fn(),
         ...overrides,
@@ -44,9 +45,13 @@ describe('runPollCycle', () => {
         const metrics = createMetrics();
         const logger = fakeLogger();
 
-        await runPollCycle(db, todoist, logger, metrics, STARTER_LABEL, ':memory:');
+        const scanCursor = createCompletionScanCursor();
+        await runPollCycle(db, todoist, logger, metrics, STARTER_LABEL, ':memory:', scanCursor);
 
         expect(logger.error).not.toHaveBeenCalled();
+        expect(logger.warn).not.toHaveBeenCalled();
+        expect(todoist.getCompletionEventsSince).toHaveBeenCalledTimes(1);
+        expect(scanCursor.get()).not.toBeNull(); // the fetch succeeded, so the cursor advanced
         expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('poll cycle complete in'));
         expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('1 tracked, 0 onboarded, 0 completions recorded, 0 pruned'));
 
@@ -63,7 +68,7 @@ describe('runPollCycle', () => {
         const metrics = createMetrics();
         const logger = fakeLogger();
 
-        await runPollCycle(db, todoist, logger, metrics, STARTER_LABEL, ':memory:');
+        await runPollCycle(db, todoist, logger, metrics, STARTER_LABEL, ':memory:', createCompletionScanCursor());
 
         expect(logger.error).toHaveBeenCalledWith('poll cycle failed: 401 Unauthorized from Todoist');
         expect(logger.info).not.toHaveBeenCalled();
