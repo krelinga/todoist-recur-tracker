@@ -76,9 +76,11 @@ workflow ([`.github/workflows/docker-release.yml`](.github/workflows/docker-rele
    gh workflow run docker-release.yml --ref <branch-or-tag>
    ```
 3. It runs typecheck + tests, then builds and publishes
-   `ghcr.io/<owner>/<repo>` tagged with `major`, `major.minor`, and
-   `major.minor.patch` read from `package.json` — e.g. version `1.2.3`
-   produces `:1`, `:1.2`, and `:1.2.3`.
+   `ghcr.io/<owner>/<repo>` tagged with `major`, `major.minor`,
+   `major.minor.patch`, and `latest` — e.g. version `1.2.3` produces `:1`,
+   `:1.2`, `:1.2.3`, and `:latest`. Since every run moves `latest`
+   regardless of which version it's for, only trigger this from the
+   commit you actually want `latest` to point at.
 
 ```sh
 docker pull ghcr.io/krelinga/todoist-recur-tracker:1

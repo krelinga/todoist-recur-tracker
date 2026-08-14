@@ -64,3 +64,4 @@ jobs:
             ${{ steps.image.outputs.name }}:${{ steps.version.outputs.major }}
             ${{ steps.image.outputs.name }}:${{ steps.version.outputs.major_minor }}
             ${{ steps.image.outputs.name }}:${{ steps.version.outputs.full }}
+            ${{ steps.image.outputs.name }}:latest
