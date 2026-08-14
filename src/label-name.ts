@@ -10,3 +10,16 @@ export function counterLabelName(shortId: number, recurrenceCount: number): stri
 export function shortIdTag(shortId: number): string {
     return `${COUNTER_EMOJI} #${shortId}`;
 }
+
+/**
+ * Matches this task's counter label regardless of its current count.
+ *
+ * Used for the Phase B tracking check instead of comparing against a
+ * locally-recomputed exact name: if a rename committed to SQLite but never
+ * reached Todoist (crash between the two - design doc section 6), the live
+ * label still shows the old count. Matching on the shortId portion alone
+ * (unique per task) finds it regardless, avoiding a false prune.
+ */
+export function counterLabelPattern(shortId: number): RegExp {
+    return new RegExp(`^${COUNTER_EMOJI} x\\d+ #${shortId}$`, 'u');
+}
