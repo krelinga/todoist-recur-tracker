@@ -2,6 +2,7 @@
   "compilerOptions": {
     "target": "es2023",
     "lib": ["es2023"],
+    "types": ["node"],
     "module": "commonjs",
     "moduleResolution": "bundler",
     "outDir": "dist",
