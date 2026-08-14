@@ -1,0 +1,43 @@
+{
+  "name": "todoist-recur-tracker",
+  "version": "1.0.0",
+  "description": "Self-hosted service that tracks Todoist recurring-task completions via a per-task counter label.",
+  "main": "dist/index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/krelinga/todoist-recur-tracker.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/krelinga/todoist-recur-tracker/issues"
+  },
+  "homepage": "https://github.com/krelinga/todoist-recur-tracker#readme",
+  "dependencies": {
+    "@doist/todoist-sdk": "^14.0.0",
+    "prom-client": "^15.1.3",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "undici": "^8.10.0"
+  }
+}
