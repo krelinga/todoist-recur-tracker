@@ -62,6 +62,28 @@ docker run --rm -v recurrence-tracker-data:/data -v "$PWD":/backup alpine \
   tar xzf /backup/recurrence-tracker-data.tgz -C /data
 ```
 
+## Releasing
+
+Docker images are published to GitHub Container Registry via a manual-only
+workflow ([`.github/workflows/docker-release.yml`](.github/workflows/docker-release.yml))
+— it never runs automatically on push, PR, or a schedule. To cut a release:
+
+1. Bump `version` in `package.json` and run `npm install` to resync
+   `package-lock.json` (the pre-commit hook enforces this before you can
+   even commit it).
+2. Trigger the workflow from the repo's Actions tab ("Run workflow"), or:
+   ```sh
+   gh workflow run docker-release.yml --ref <branch-or-tag>
+   ```
+3. It runs typecheck + tests, then builds and publishes
+   `ghcr.io/<owner>/<repo>` tagged with `major`, `major.minor`, and
+   `major.minor.patch` read from `package.json` — e.g. version `1.2.3`
+   produces `:1`, `:1.2`, and `:1.2.3`.
+
+```sh
+docker pull ghcr.io/krelinga/todoist-recur-tracker:1
+```
+
 ## Development
 
 Requires Node 20.18.1+ (the project targets Node 24).
